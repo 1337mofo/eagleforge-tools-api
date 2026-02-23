@@ -16,6 +16,7 @@ from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+import stripe
 import requests
 from bs4 import BeautifulSoup
 import dns.resolver
@@ -24,6 +25,17 @@ import markdown as md_lib
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("eagleforge")
+
+# --- Stripe ---
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+
+# Credit packs: {pack_id: (calls, price_cents, description)}
+CREDIT_PACKS = {
+    "starter": (500, 200, "500 calls - $2.00"),
+    "pro": (5000, 1500, "5,000 calls - $15.00"),
+    "business": (50000, 10000, "50,000 calls - $100.00"),
+}
 
 app = FastAPI(
     title="EagleForge Tools API",
@@ -64,10 +76,21 @@ def init_db():
         email TEXT UNIQUE,
         api_key TEXT UNIQUE,
         free_calls_remaining INTEGER DEFAULT 100,
+        paid_calls_remaining INTEGER DEFAULT 0,
         total_calls INTEGER DEFAULT 0,
+        total_spent_cents INTEGER DEFAULT 0,
         created_at TEXT,
         is_active INTEGER DEFAULT 1
     )""")
+    # Add columns if they don't exist (migration for existing DBs)
+    try:
+        conn.execute("ALTER TABLE api_keys ADD COLUMN paid_calls_remaining INTEGER DEFAULT 0")
+    except:
+        pass
+    try:
+        conn.execute("ALTER TABLE api_keys ADD COLUMN total_spent_cents INTEGER DEFAULT 0")
+    except:
+        pass
     conn.commit()
     conn.close()
 
@@ -109,12 +132,22 @@ async def verify_api_key(request: Request):
     if not row:
         raise HTTPException(status_code=403, detail="Invalid API key. Get one free: POST /auth/register")
     
-    if row["free_calls_remaining"] <= 0:
-        raise HTTPException(status_code=402, detail="Free tier exhausted (100 calls used). Contact info@agentdirectory.exchange to upgrade.")
+    free = row["free_calls_remaining"]
+    paid = row["paid_calls_remaining"] if row["paid_calls_remaining"] else 0
     
-    # Decrement free calls, increment total
+    if free <= 0 and paid <= 0:
+        raise HTTPException(
+            status_code=402, 
+            detail="No calls remaining. Buy more: POST /auth/buy-credits with pack=starter|pro|business. "
+                   "Packs: 500 calls/$2, 5000/$15, 50000/$100."
+        )
+    
+    # Decrement: use free calls first, then paid
     conn = get_db()
-    conn.execute("UPDATE api_keys SET free_calls_remaining=free_calls_remaining-1, total_calls=total_calls+1 WHERE api_key=?", (key,))
+    if free > 0:
+        conn.execute("UPDATE api_keys SET free_calls_remaining=free_calls_remaining-1, total_calls=total_calls+1 WHERE api_key=?", (key,))
+    else:
+        conn.execute("UPDATE api_keys SET paid_calls_remaining=paid_calls_remaining-1, total_calls=total_calls+1 WHERE api_key=?", (key,))
     conn.commit()
     conn.close()
     
@@ -174,8 +207,115 @@ async def get_usage(api_key: str = Depends(verify_api_key)):
     return {
         "email": row["email"],
         "free_calls_remaining": row["free_calls_remaining"],
+        "paid_calls_remaining": row["paid_calls_remaining"] if row["paid_calls_remaining"] else 0,
         "total_calls": row["total_calls"],
         "created_at": row["created_at"]
+    }
+
+
+# --- Stripe Payment Endpoints ---
+class BuyCreditsRequest(BaseModel):
+    pack: str = Field(pattern="^(starter|pro|business)$")
+
+
+@app.post("/auth/buy-credits")
+async def buy_credits(req: BuyCreditsRequest, api_key: str = Depends(verify_api_key)):
+    """Create a Stripe Checkout session to buy API call credits."""
+    if not stripe.api_key:
+        raise HTTPException(status_code=503, detail="Payments not configured yet. Contact info@agentdirectory.exchange.")
+    
+    pack = CREDIT_PACKS.get(req.pack)
+    if not pack:
+        raise HTTPException(status_code=400, detail=f"Invalid pack. Choose: starter, pro, business")
+    
+    calls, price_cents, description = pack
+    
+    try:
+        session = stripe.checkout.Session.create(
+            payment_method_types=["card"],
+            line_items=[{
+                "price_data": {
+                    "currency": "usd",
+                    "product_data": {
+                        "name": f"EagleForge API Credits - {req.pack.title()}",
+                        "description": description,
+                    },
+                    "unit_amount": price_cents,
+                },
+                "quantity": 1,
+            }],
+            mode="payment",
+            success_url="https://agentdirectory.exchange/payment-success",
+            cancel_url="https://agentdirectory.exchange/payment-cancel",
+            metadata={
+                "api_key": api_key,
+                "pack": req.pack,
+                "calls": str(calls),
+            },
+        )
+        return {
+            "checkout_url": session.url,
+            "session_id": session.id,
+            "pack": req.pack,
+            "calls": calls,
+            "price_usd": price_cents / 100,
+        }
+    except stripe.error.StripeError as e:
+        raise HTTPException(status_code=500, detail=f"Payment error: {str(e)[:200]}")
+
+
+@app.post("/webhooks/stripe")
+async def stripe_webhook(request: Request):
+    """Handle Stripe webhook for completed payments."""
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+    
+    try:
+        if STRIPE_WEBHOOK_SECRET:
+            event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+        else:
+            event = stripe.Event.construct_from(
+                stripe.util.json.loads(payload), stripe.api_key
+            )
+    except (ValueError, stripe.error.SignatureVerificationError):
+        raise HTTPException(status_code=400, detail="Invalid webhook")
+    
+    if event["type"] == "checkout.session.completed":
+        session = event["data"]["object"]
+        metadata = session.get("metadata", {})
+        api_key = metadata.get("api_key")
+        calls = int(metadata.get("calls", 0))
+        pack = metadata.get("pack", "unknown")
+        amount = session.get("amount_total", 0)
+        
+        if api_key and calls > 0:
+            conn = get_db()
+            conn.execute(
+                "UPDATE api_keys SET paid_calls_remaining=paid_calls_remaining+?, total_spent_cents=total_spent_cents+? WHERE api_key=?",
+                (calls, amount, api_key)
+            )
+            conn.commit()
+            conn.close()
+            logger.info(f"Credits added: {calls} calls for key {api_key[:10]}... (pack: {pack})")
+    
+    return {"status": "ok"}
+
+
+@app.get("/auth/plans")
+async def get_plans():
+    """List available credit packs."""
+    return {
+        "plans": [
+            {
+                "pack": name,
+                "calls": calls,
+                "price_usd": price_cents / 100,
+                "price_per_call": round(price_cents / 100 / calls, 6),
+                "description": desc,
+            }
+            for name, (calls, price_cents, desc) in CREDIT_PACKS.items()
+        ],
+        "how_to_buy": "POST /auth/buy-credits with {pack: 'starter'|'pro'|'business'} and X-API-Key header",
     }
 
 

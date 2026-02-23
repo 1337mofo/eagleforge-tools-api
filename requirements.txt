@@ -5,3 +5,4 @@ beautifulsoup4
 dnspython
 markdownify
 markdown
+stripe
