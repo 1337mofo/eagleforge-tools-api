@@ -107,7 +107,11 @@ class ScrapeRequest(BaseModel):
 async def scrape(req: ScrapeRequest, api_key: str = Depends(verify_api_key)):
     try:
         headers = {"User-Agent": "EagleForge-Scraper/1.0 (+https://agentdirectory.exchange)"}
-        resp = requests.get(req.url, headers=headers, timeout=10, allow_redirects=True)
+        # Try with SSL verification first, fallback to no verification if it fails
+        try:
+            resp = requests.get(req.url, headers=headers, timeout=10, allow_redirects=True, verify=True)
+        except requests.exceptions.SSLError:
+            resp = requests.get(req.url, headers=headers, timeout=10, allow_redirects=True, verify=False)
         resp.raise_for_status()
     except requests.Timeout:
         raise HTTPException(status_code=504, detail="Target URL timed out")
