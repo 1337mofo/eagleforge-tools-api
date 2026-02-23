@@ -6,8 +6,11 @@ import os
 import re
 import time
 import logging
+import sqlite3
+import secrets
 from collections import defaultdict
 from typing import Optional
+from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -44,23 +47,136 @@ TOOL_PRICING = {
     "convert": 0.001,
 }
 
+# --- Database ---
+DB_PATH = os.getenv("KEYS_DB_PATH", "/app/keys.db")
+
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = get_db()
+    conn.execute("""CREATE TABLE IF NOT EXISTS api_keys (
+        id TEXT PRIMARY KEY,
+        email TEXT UNIQUE,
+        api_key TEXT UNIQUE,
+        free_calls_remaining INTEGER DEFAULT 100,
+        total_calls INTEGER DEFAULT 0,
+        created_at TEXT,
+        is_active INTEGER DEFAULT 1
+    )""")
+    conn.commit()
+    conn.close()
+
+
+init_db()
+
 # --- Auth ---
 VALID_API_KEYS = set(
     k.strip() for k in os.getenv("VALID_API_KEYS", "").split(",") if k.strip()
 )
-# Always allow a demo key for testing
 VALID_API_KEYS.add("eagle-demo-key-2026")
 
 usage_tracker: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+rate_limiter: dict[str, list[float]] = defaultdict(list)
+RATE_LIMIT = 10  # max calls per minute
 
 
 async def verify_api_key(request: Request):
     key = request.headers.get("x-api-key") or request.query_params.get("api_key")
     if not key:
-        raise HTTPException(status_code=401, detail="Missing API key. Set X-API-Key header.")
-    if key not in VALID_API_KEYS:
-        raise HTTPException(status_code=403, detail="Invalid API key.")
+        raise HTTPException(status_code=401, detail="Missing API key. Set X-API-Key header. Get one free: POST /auth/register")
+    
+    # Check rate limit
+    now = time.time()
+    rate_limiter[key] = [t for t in rate_limiter[key] if now - t < 60]
+    if len(rate_limiter[key]) >= RATE_LIMIT:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. Max 10 calls/minute.")
+    rate_limiter[key].append(now)
+    
+    # Check env-based keys first (unlimited)
+    if key in VALID_API_KEYS:
+        return key
+    
+    # Check database
+    conn = get_db()
+    row = conn.execute("SELECT * FROM api_keys WHERE api_key=? AND is_active=1", (key,)).fetchone()
+    conn.close()
+    
+    if not row:
+        raise HTTPException(status_code=403, detail="Invalid API key. Get one free: POST /auth/register")
+    
+    if row["free_calls_remaining"] <= 0:
+        raise HTTPException(status_code=402, detail="Free tier exhausted (100 calls used). Contact info@agentdirectory.exchange to upgrade.")
+    
+    # Decrement free calls, increment total
+    conn = get_db()
+    conn.execute("UPDATE api_keys SET free_calls_remaining=free_calls_remaining-1, total_calls=total_calls+1 WHERE api_key=?", (key,))
+    conn.commit()
+    conn.close()
+    
     return key
+
+
+# --- Auth Endpoints ---
+class RegisterRequest(BaseModel):
+    email: str
+
+
+@app.post("/auth/register")
+async def register(req: RegisterRequest):
+    email = req.email.strip().lower()
+    if not re.match(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", email):
+        raise HTTPException(status_code=400, detail="Invalid email format")
+    
+    conn = get_db()
+    existing = conn.execute("SELECT api_key, free_calls_remaining, total_calls FROM api_keys WHERE email=?", (email,)).fetchone()
+    
+    if existing:
+        conn.close()
+        return {
+            "api_key": existing["api_key"],
+            "email": email,
+            "free_calls": existing["free_calls_remaining"],
+            "total_calls": existing["total_calls"],
+            "message": "Existing key returned. 100 free calls included."
+        }
+    
+    api_key = "ef-" + secrets.token_hex(16)
+    key_id = secrets.token_hex(8)
+    conn.execute(
+        "INSERT INTO api_keys (id, email, api_key, created_at) VALUES (?, ?, ?, ?)",
+        (key_id, email, api_key, datetime.utcnow().isoformat())
+    )
+    conn.commit()
+    conn.close()
+    
+    return {
+        "api_key": api_key,
+        "email": email,
+        "free_calls": 100,
+        "message": "API key created! 100 free calls included. Set X-API-Key header on all /tools/* requests."
+    }
+
+
+@app.get("/auth/usage")
+async def get_usage(api_key: str = Depends(verify_api_key)):
+    conn = get_db()
+    row = conn.execute("SELECT email, free_calls_remaining, total_calls, created_at FROM api_keys WHERE api_key=?", (api_key,)).fetchone()
+    conn.close()
+    
+    if not row:
+        return {"api_key": api_key, "type": "env_key", "usage": usage_tracker.get(api_key, {})}
+    
+    return {
+        "email": row["email"],
+        "free_calls_remaining": row["free_calls_remaining"],
+        "total_calls": row["total_calls"],
+        "created_at": row["created_at"]
+    }
 
 
 def tool_response(tool: str, result: dict, api_key: str, success: bool = True):
